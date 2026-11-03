@@ -1,0 +1,41 @@
+import 'dotenv/config';
+import express from 'express';
+import session from 'express-session';
+import connectPgSimple from 'connect-pg-simple';
+import pg from 'pg';
+import bcrypt from 'bcryptjs';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import { randomUUID } from 'node:crypto';
+
+if (!process.env.DATABASE_URL || !process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32) {
+  throw new Error('Set DATABASE_URL and a SESSION_SECRET of at least 32 characters');
+}
+const app = express();
+if (process.env.TRUST_PROXY === '1') app.set('trust proxy', 1);
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: true } });
+const PgStore = connectPgSimple(session);
+app.disable('x-powered-by');
+app.use(helmet({ contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], scriptSrc: ["'self'"], styleSrc: ["'self'"], imgSrc: ["'self'", 'data:'], connectSrc: ["'self'"], objectSrc: ["'none'"], frameAncestors: ["'none'"] } } }));
+app.use(express.json({ limit: '80kb' }));
+app.use(session({ name: 'pw.sid', secret: process.env.SESSION_SECRET, resave: false, saveUninitialized: false, rolling: true, store: new PgStore({ pool, createTableIfMissing: true }), cookie: { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 7 * 24 * 60 * 60 * 1000 } }));
+app.use(express.static('public'));
+const authLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 15, standardHeaders: 'draft-7', legacyHeaders: false });
+const safe = fn => (req,res,next) => Promise.resolve(fn(req,res,next)).catch(next);
+const requireUser = (req,res,next) => req.session.userId ? next() : res.status(401).json({ error: 'Log in first' });
+const validPixels = p => Array.isArray(p) && p.length === 256 && p.every(x => typeof x === 'string' && /^#[0-9a-fA-F]{6}$/.test(x));
+const csrf = (req,res,next) => { if (!req.session.csrf) req.session.csrf = randomUUID(); if (['POST','PUT','PATCH','DELETE'].includes(req.method) && req.get('x-csrf-token') !== req.session.csrf) return res.status(403).json({error:'Invalid CSRF token'}); next(); };
+app.use('/api', csrf);
+app.get('/api/me', safe(async (req,res) => { if (!req.session.userId) return res.json({user:null, csrf:req.session.csrf}); const {rows} = await pool.query('SELECT id,username FROM users WHERE id=$1',[req.session.userId]); res.json({user:rows[0]||null,csrf:req.session.csrf}); }));
+app.post('/api/register', authLimit, safe(async (req,res) => { const {username,password} = req.body || {}; if (typeof username !== 'string' || !/^[a-zA-Z0-9_]{3,30}$/.test(username) || typeof password !== 'string' || password.length < 12 || password.length > 128) return res.status(400).json({error:'Username: 3–30 letters/numbers/underscores. Password: 12–128 characters.'}); const hash = await bcrypt.hash(password,12); try { const {rows} = await pool.query('INSERT INTO users(username,password_hash) VALUES($1,$2) RETURNING id,username',[username,hash]); req.session.regenerate(err => {if(err) return res.status(500).json({error:'Session error'}); req.session.userId=rows[0].id; req.session.csrf=randomUUID(); req.session.save(e=>e?res.status(500).json({error:'Session error'}):res.json({user:rows[0],csrf:req.session.csrf}));}); } catch(e){if(e.code==='23505') return res.status(409).json({error:'Username already taken'}); throw e;} }));
+app.post('/api/login', authLimit, safe(async(req,res)=>{const {username,password}=req.body||{}; if(typeof username!=='string'||typeof password!=='string')return res.status(400).json({error:'Invalid login'}); const {rows}=await pool.query('SELECT * FROM users WHERE username=$1',[username]); if(!rows[0]||!await bcrypt.compare(password,rows[0].password_hash))return res.status(401).json({error:'Invalid username or password'}); req.session.regenerate(err=>{if(err)return res.status(500).json({error:'Session error'});req.session.userId=rows[0].id;req.session.csrf=randomUUID();req.session.save(e=>e?res.status(500).json({error:'Session error'}):res.json({user:{id:rows[0].id,username:rows[0].username},csrf:req.session.csrf}));});}));
+app.post('/api/logout',(req,res)=>req.session.destroy(()=>{res.clearCookie('pw.sid');res.json({ok:true});}));
+app.get('/api/projects',requireUser,safe(async(req,res)=>{const {rows}=await pool.query('SELECT id,title,public,plays,updated_at FROM projects WHERE owner_id=$1 ORDER BY updated_at DESC LIMIT 100',[req.session.userId]);res.json(rows);}));
+app.post('/api/projects',requireUser,safe(async(req,res)=>{const title=String(req.body?.title||'Untitled').trim().slice(0,80);const pixels=Array(256).fill('#ffffff');const {rows}=await pool.query('INSERT INTO projects(owner_id,title,pixels) VALUES($1,$2,$3) RETURNING id',[req.session.userId,title||'Untitled',JSON.stringify(pixels)]);res.status(201).json(rows[0]);}));
+app.get('/api/projects/:id',requireUser,safe(async(req,res)=>{const {rows}=await pool.query('SELECT id,title,pixels,public,plays FROM projects WHERE id=$1 AND owner_id=$2',[req.params.id,req.session.userId]);if(!rows[0])return res.status(404).json({error:'Not found'});res.json(rows[0]);}));
+app.put('/api/projects/:id',requireUser,safe(async(req,res)=>{const {title,pixels,isPublic}=req.body||{};if(typeof title!=='string'||!title.trim()||title.length>80||!validPixels(pixels)||typeof isPublic!=='boolean')return res.status(400).json({error:'Invalid project'});const {rowCount}=await pool.query('UPDATE projects SET title=$1,pixels=$2,public=$3,updated_at=now() WHERE id=$4 AND owner_id=$5',[title.trim(),JSON.stringify(pixels),isPublic,req.params.id,req.session.userId]);if(!rowCount)return res.status(404).json({error:'Not found'});res.json({ok:true});}));
+app.get('/api/discover',safe(async(req,res)=>{const {rows}=await pool.query('SELECT p.id,p.title,p.plays,u.username FROM projects p JOIN users u ON u.id=p.owner_id WHERE p.public=true ORDER BY p.updated_at DESC LIMIT 50');res.json(rows);}));
+app.get('/api/play/:id',safe(async(req,res)=>{const {rows}=await pool.query('UPDATE projects SET plays=plays+1 WHERE id=$1 AND public=true RETURNING title,pixels,plays',[req.params.id]);if(!rows[0])return res.status(404).json({error:'Not found'});res.set('Cache-Control','no-store');res.json(rows[0]);}));
+app.use((err,req,res,next)=>{console.error(err);res.status(500).json({error:'Server error'});});
+const port=Number(process.env.PORT||3000);
+app.listen(port,()=>console.log(`PixelWorld running on port ${port}`));
